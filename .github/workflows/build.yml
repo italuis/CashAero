@@ -1,0 +1,426 @@
+name: build
+run-name: build ${{ inputs.id }}
+on:
+  workflow_dispatch:
+    inputs:
+      id:
+        required: true
+permissions:
+  contents: write
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      ID: ${{ inputs.id }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: jobs
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - name: Set up Android SDK
+        continue-on-error: true
+        uses: android-actions/setup-android@v3
+      - name: Check Android SDK
+        run: |
+          export ANDROID_HOME="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null 2>&1 || true
+          ls "$ANDROID_HOME" || true
+      - name: Unpack and read settings
+        run: |
+          set -e
+          exec > >(tee -a "$RUNNER_TEMP/build.log") 2>&1
+          [[ "$ID" =~ ^[a-f0-9]{8}$ ]]
+          mkdir src
+          unzip -q "jobs/$ID.zip" -d src
+          cat > "$RUNNER_TEMP/cfg.js" <<'JS'
+          const fs = require('fs');
+          let c = {};
+          try { c = JSON.parse(fs.readFileSync('src/androidbuilder.json', 'utf8')); } catch (e) {}
+          const ok = (v, re, d) => (re.test(String(v)) ? String(v) : d);
+          const o = {
+            NAME: ok(c.name, /^[\p{L}\p{N} ._-]{1,40}$/u, 'App'),
+            APPID: ok(c.id, /^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+$/i, 'com.example.app'),
+            VNAME: ok(c.versionName, /^[A-Za-z0-9._-]{1,20}$/, '1.0.0'),
+            VCODE: ok(c.versionCode, /^[0-9]{1,9}$/, '1'),
+            MINSDK: ok(c.minSdk, /^[0-9]{2}$/, '24'),
+            TARGETSDK: ok(c.targetSdk, /^[0-9]{2}$/, '34')
+          };
+          const url = /^https?:\/\/[^\s"'<>\\]+$/i.test(String(c.url || '')) ? String(c.url) : '';
+          o.TYPE = String(c.type || '') === 'url' ? 'url'
+            : fs.existsSync('src/pubspec.yaml') ? 'flutter'
+            : (fs.existsSync('src/settings.gradle') || fs.existsSync('src/settings.gradle.kts')) ? 'gradle' : 'web';
+          const web = o.TYPE === 'url' || o.TYPE === 'web';
+          o.RELEASE = web && (c.release === true || c.release === 'true') ? '1' : '0';
+          o.TV = web && (c.tv === true || c.tv === 'true') ? '1' : '0';
+          o.THEME = '#2563eb';
+          if (o.RELEASE === '1') o.TARGETSDK = '36';
+          const iu = String(c.iconUrl || '');
+          if (/^https?:\/\/[^\s"'<>\\]+$/i.test(iu)) o.ICONURL = iu;
+          if (o.TYPE === 'url') {
+            if (!url) { console.error('Missing or invalid url in androidbuilder.json'); process.exit(1); }
+            o.URL = url;
+          }
+          fs.appendFileSync(process.env.GITHUB_ENV, Object.entries(o).map(([k, v]) => k + '=' + v).join('\n') + '\n');
+          JS
+          node "$RUNNER_TEMP/cfg.js"
+      - name: Scan website (name, icon, colour)
+        if: env.TYPE == 'url'
+        run: |
+          set -e
+          exec > >(tee -a "$RUNNER_TEMP/build.log") 2>&1
+          command -v convert >/dev/null || sudo apt-get install -y imagemagick
+          cat > "$RUNNER_TEMP/scan.js" <<'JS'
+          const fs = require('fs');
+          const { execFileSync } = require('child_process');
+          const UA = 'Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36';
+          const start = process.env.URL;
+          const get = async (u, bin) => {
+            const r = await fetch(u, { headers: { 'User-Agent': UA, 'Accept-Language': 'en' }, redirect: 'follow', signal: AbortSignal.timeout(20000) });
+            if (!r.ok) throw new Error('HTTP ' + r.status);
+            return bin ? { buf: Buffer.from(await r.arrayBuffer()), url: r.url } : { text: await r.text(), url: r.url };
+          };
+          const attrs = (tag) => { const o = {}; for (const m of tag.matchAll(/([A-Za-z:_-]+)\s*=\s*(?:"([^"]*)"|'([^']*)')/g)) o[m[1].toLowerCase()] = (m[2] ?? m[3] ?? '').trim(); return o; };
+          const tags = (html, name) => [...html.matchAll(new RegExp('<' + name + '\\b[^>]*>', 'gi'))].map((m) => attrs(m[0]));
+          const size = (s) => Math.max(0, ...String(s || '').split(/\s+/).map((x) => parseInt(x, 10) || 0));
+          const valid = (f) => { try { execFileSync('convert', [f + '[0]', '-resize', '16x16', 'null:'], { stdio: 'ignore' }); return true; } catch (e) { return false; } };
+          (async () => {
+            let html = '', base = start;
+            try { const g = await get(start); html = g.text; base = g.url; } catch (e) { console.log('Could not read the page:', e.message); }
+            const metas = tags(html, 'meta'), links = tags(html, 'link');
+            const meta = (k) => (metas.find((m) => m.property === k || m.name === k) || {}).content || '';
+            const host = new URL(base).hostname.replace(/^www\./, '');
+            const rawTitle = meta('og:site_name') || ((html.match(/<title[^>]*>([^<]{1,120})/i) || [])[1] || '').trim() || host;
+            let theme = meta('theme-color');
+            if (/^#[0-9a-f]{3}$/i.test(theme)) theme = '#' + theme.slice(1).split('').map((x) => x + x).join('');
+            if (!/^#[0-9a-f]{6}$/i.test(theme)) theme = '#2563eb';
+            const cand = [];
+            const add = (href, sz, pri) => { try { cand.push({ u: new URL(href, base).href, sz, pri }); } catch (e) {} };
+            const man = links.find((l) => /manifest/i.test(l.rel || '') && l.href);
+            if (man) {
+              try {
+                const mu = new URL(man.href, base).href;
+                const mj = JSON.parse((await get(mu)).text);
+                for (const i of mj.icons || []) if (i.src) add(new URL(i.src, mu).href, size(i.sizes), 3);
+              } catch (e) {}
+            }
+            for (const l of links) if (/icon/i.test(l.rel || '') && l.href) add(l.href, size(l.sizes), /apple/i.test(l.rel) ? 2 : 1);
+            add('/favicon.ico', 0, 0);
+            cand.sort((a, b) => b.pri - a.pri || b.sz - a.sz);
+            let icon = '';
+            for (const c of cand.slice(0, 12)) {
+              try {
+                const g = await get(c.u, true);
+                if (g.buf.length < 300) continue;
+                fs.writeFileSync('icon.src', g.buf);
+                if (valid('icon.src')) { icon = c.u; break; }
+                fs.unlinkSync('icon.src');
+              } catch (e) {}
+            }
+            let c = {};
+            try { c = JSON.parse(fs.readFileSync('src/androidbuilder.json', 'utf8')); } catch (e) {}
+            const nm = String(c.name || '').trim();
+            const clean = rawTitle.replace(/[^\p{L}\p{N} ._-]/gu, ' ').replace(/\s+/g, ' ').trim().slice(0, 30);
+            const out = { THEME: theme };
+            if (!nm || /^auto$/i.test(nm)) out.NAME = clean || host.slice(0, 30);
+            fs.appendFileSync(process.env.GITHUB_ENV, Object.entries(out).map(([k, v]) => k + '=' + v).join('\n') + '\n');
+            console.log('Site: ' + base + '\nTitle: ' + rawTitle + '\nDescription: ' + meta('description').slice(0, 200) + '\nTheme: ' + theme + '\nIcon: ' + (icon || 'none found (letter icon will be used)'));
+          })();
+          JS
+          node "$RUNNER_TEMP/scan.js"
+      - name: Custom icon
+        if: env.TYPE == 'url' || env.TYPE == 'web'
+        run: |
+          set -e
+          exec > >(tee -a "$RUNNER_TEMP/build.log") 2>&1
+          command -v convert >/dev/null || sudo apt-get install -y imagemagick
+          rm -f custom.src
+          if [ -f src/androidbuilder-icon.png ]; then
+            cp src/androidbuilder-icon.png custom.src
+          elif [ -n "$ICONURL" ]; then
+            curl -fsSL --max-time 30 -A "Mozilla/5.0" -o custom.src "$ICONURL" || echo "Icon download failed, using the fallback icon"
+            if [ -f custom.src ] && ! convert "custom.src[0]" -resize 16x16 null: 2>/dev/null && grep -qi '<html' custom.src; then
+              echo "The icon link is a web page, looking for its image"
+              U=$(grep -oiE '<meta[^>]+(og:image|twitter:image)[^>]*>' custom.src | grep -oE 'content="[^"]+"' | head -n1 | sed -e 's/^content="//' -e 's/"$//' | sed 's/&amp;/\&/g')
+              if [ -n "$U" ]; then curl -fsSL --max-time 30 -A "Mozilla/5.0" -o custom.src "$U" || rm -f custom.src; else rm -f custom.src; fi
+            fi
+          fi
+          if [ -f custom.src ]; then
+            if convert "custom.src[0]" -resize 16x16 null: 2>/dev/null; then
+              cp custom.src icon.src
+              echo "Using the custom icon"
+            else
+              echo "The custom icon is not a valid image, ignoring it"
+            fi
+          fi
+      - name: Make icons and TV banner
+        if: env.TYPE == 'url' || env.TYPE == 'web'
+        run: |
+          set -e
+          exec > >(tee -a "$RUNNER_TEMP/build.log") 2>&1
+          mkdir -p "$RUNNER_TEMP/icons"
+          rm -f icon512.png
+          if [ -f icon.src ]; then
+            convert "icon.src[0]" -background none -resize 512x512 -gravity center -extent 512x512 icon512.png || rm -f icon512.png
+          fi
+          if [ ! -f icon512.png ] && [ "$TYPE" = url ]; then
+            L=$(printf '%s' "$NAME" | cut -c1 | tr a-z A-Z)
+            convert -size 512x512 "xc:$THEME" -gravity center -fill white -font DejaVu-Sans-Bold -pointsize 300 -annotate 0 "$L" icon512.png \
+              || convert -size 512x512 "xc:$THEME" -gravity center -fill white -pointsize 300 -annotate 0 "$L" icon512.png \
+              || convert -size 512x512 "xc:$THEME" icon512.png
+          fi
+          if [ -f icon512.png ]; then
+            OPAQUE=$(convert icon512.png -format '%[opaque]' info: 2>/dev/null || echo False)
+            for d in mdpi:48:108 hdpi:72:162 xhdpi:96:216 xxhdpi:144:324 xxxhdpi:192:432; do
+              N="${d%%:*}"; R="${d#*:}"; L="${R%%:*}"; S="${R#*:}"; F=$((S*66/100))
+              convert icon512.png -resize "${L}x${L}" "$RUNNER_TEMP/icons/$N.png"
+              convert icon512.png -resize "${F}x${F}" -background none -gravity center -extent "${S}x${S}" "$RUNNER_TEMP/icons/$N-fg.png"
+              if [ "$OPAQUE" = True ]; then
+                convert icon512.png -resize "${S}x${S}^" -gravity center -extent "${S}x${S}" -blur "0x$((S/10))" "$RUNNER_TEMP/icons/$N-bg.png"
+              else
+                convert -size "${S}x${S}" xc:white "$RUNNER_TEMP/icons/$N-bg.png"
+              fi
+              convert "$RUNNER_TEMP/icons/$N-bg.png" "$RUNNER_TEMP/icons/$N-fg.png" -composite "$RUNNER_TEMP/icons/$N-comp.png"
+            done
+            echo "HASICONS=1" >> "$GITHUB_ENV"
+          fi
+          if [ "$TV" = 1 ]; then
+            T="${NAME:0:18}"
+            convert -size 320x180 "xc:$THEME" banner.png
+            if [ -f icon512.png ]; then
+              convert icon512.png -resize 84x84 icon84.png
+              convert banner.png icon84.png -gravity north -geometry +0+14 -composite banner.png
+            fi
+            convert banner.png -gravity south -fill white -font DejaVu-Sans-Bold -pointsize 26 -annotate +0+14 "$T" banner2.png \
+              || convert banner.png -gravity south -fill white -pointsize 26 -annotate +0+14 "$T" banner2.png \
+              || cp banner.png banner2.png
+            mv banner2.png "$RUNNER_TEMP/banner.png"
+            echo "Created the Android TV banner"
+          fi
+      - name: Signing key (Play Store)
+        if: env.RELEASE == '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          exec > >(tee -a "$RUNNER_TEMP/build.log") 2>&1
+          mkdir -p "$RUNNER_TEMP/ks"
+          URL="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          K="$RUNNER_TEMP/keysrepo"
+          if git clone -q --depth=1 -b keys "$URL" "$K" 2>/dev/null; then
+            echo "Found the keys branch"
+          else
+            rm -rf "$K"
+            git init -q -b keys "$K"
+            git -C "$K" remote add origin "$URL"
+          fi
+          if [ -f "$K/$APPID.jks" ] && [ -f "$K/$APPID.pass" ]; then
+            cp "$K/$APPID.jks" "$K/$APPID.pass" "$RUNNER_TEMP/ks/"
+            echo "Using the existing signing key for $APPID"
+          else
+            P=$(openssl rand -hex 16)
+            keytool -genkeypair -noprompt -keystore "$RUNNER_TEMP/ks/$APPID.jks" -alias upload -keyalg RSA -keysize 2048 -validity 10000 -storepass "$P" -keypass "$P" -dname "CN=$NAME, O=$GITHUB_REPOSITORY_OWNER, C=US"
+            printf '%s' "$P" > "$RUNNER_TEMP/ks/$APPID.pass"
+            cp "$RUNNER_TEMP/ks/$APPID.jks" "$RUNNER_TEMP/ks/$APPID.pass" "$K/"
+            git -C "$K" add -A
+            git -C "$K" -c user.name=bot -c user.email=bot@users.noreply.github.com commit -qm "key $APPID"
+            git -C "$K" push -q origin HEAD:keys
+            echo "Created a new signing key for $APPID and saved it on the keys branch"
+          fi
+          echo "::add-mask::$(cat "$RUNNER_TEMP/ks/$APPID.pass")"
+          echo "KSPASS_FILE=$RUNNER_TEMP/ks/$APPID.pass" >> "$GITHUB_ENV"
+      - name: Write build helpers
+        if: env.TYPE == 'url' || env.TYPE == 'web'
+        run: |
+          set -e
+          cat > "$RUNNER_TEMP/patch.js" <<'JS'
+          const fs = require('fs');
+          const e = process.env;
+          const mode = e.MODE || 'full';
+          const site = e.TYPE === 'url';
+          let x = fs.readFileSync('config.xml', 'utf8');
+          const esc = (s) => s.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
+          if (site) x = x.replace(/<content src="[^"]*"\s*\/>/, () => '<content src="' + esc(e.URL) + '" />');
+          x = x.replace(/version="[^"]*"/, () => 'version="' + e.VNAME + '" android-versionCode="' + e.VCODE + '"');
+          let add = '';
+          if (site) {
+            add += '    <access origin="*" />\n    <allow-navigation href="*" />\n';
+            for (const p of ['http://*/*', 'https://*/*', 'tel:*', 'sms:*', 'mailto:*', 'geo:*']) add += '    <allow-intent href="' + p + '" />\n';
+          }
+          add += '    <preference name="android-minSdkVersion" value="' + e.MINSDK + '" />\n';
+          add += '    <preference name="android-targetSdkVersion" value="' + e.TARGETSDK + '" />\n';
+          if (site && mode !== 'minimal') add += '    <preference name="BackgroundColor" value="0xff' + e.THEME.slice(1) + '" />\n';
+          let plat = '';
+          if (e.HASICONS === '1' && mode === 'full') {
+            for (const d of ['mdpi', 'hdpi', 'xhdpi', 'xxhdpi', 'xxxhdpi']) {
+              plat += '        <icon density="' + d + '" src="res/icon/' + d + '.png"'
+                + (mode === 'full' ? ' foreground="res/icon/' + d + '-fg.png" background="res/icon/' + d + '-bg.png"' : '') + ' />\n';
+            }
+          }
+          if (e.TV === '1' && mode !== 'minimal') {
+            if (!/xmlns:android=/.test(x)) x = x.replace(/<widget /, () => '<widget xmlns:android="http://schemas.android.com/apk/res/android" ');
+            plat += '        <config-file target="AndroidManifest.xml" parent="/manifest">\n';
+            plat += '            <uses-feature android:name="android.software.leanback" android:required="false" />\n';
+            plat += '            <uses-feature android:name="android.hardware.touchscreen" android:required="false" />\n';
+            plat += '        </config-file>\n';
+            plat += '        <config-file target="AndroidManifest.xml" parent="/manifest/application/activity/intent-filter">\n';
+            plat += '            <category android:name="android.intent.category.LEANBACK_LAUNCHER" />\n';
+            plat += '        </config-file>\n';
+            plat += '        <edit-config file="AndroidManifest.xml" target="/manifest/application" mode="merge">\n';
+            plat += '            <application android:banner="@drawable/banner" />\n';
+            plat += '        </edit-config>\n';
+            plat += '        <resource-file src="res/banner.png" target="app/src/main/res/drawable/banner.png" />\n';
+          }
+          if (plat) {
+            const re = /(<platform name="android">)([\s\S]*?)(<\/platform>)/;
+            if (re.test(x)) x = x.replace(re, (m, a, b, c) => a + b + plat + '    ' + c);
+            else add += '    <platform name="android">\n' + plat + '    </platform>\n';
+          }
+          x = x.replace('</widget>', () => add + '</widget>');
+          fs.writeFileSync('config.xml', x);
+          JS
+          cat > "$RUNNER_TEMP/cbuild.sh" <<'SH'
+          apply_icons() {
+            R=platforms/android/app/src/main/res
+            if [ ! -d "$R" ] || [ ! -f ../icon512.png ]; then return 0; fi
+            OPQ=$(convert ../icon512.png -format '%[opaque]' info: 2>/dev/null || echo False)
+            find "$R" -name 'ic_launcher*.webp' -delete
+            for d in mdpi:48:108 hdpi:72:162 xhdpi:96:216 xxhdpi:144:324 xxxhdpi:192:432; do
+              N="${d%%:*}"; Q="${d#*:}"; L="${Q%%:*}"; S="${Q#*:}"; F=$((S*66/100)); D="$R/mipmap-$N"
+              mkdir -p "$D"
+              convert ../icon512.png -resize "${L}x${L}" "$D/ic_launcher.png"
+              cp "$D/ic_launcher.png" "$D/ic_launcher_round.png"
+              convert ../icon512.png -resize "${F}x${F}" -background none -gravity center -extent "${S}x${S}" "$D/ic_launcher_foreground.png"
+              if [ "$OPQ" = True ]; then
+                convert ../icon512.png -resize "${S}x${S}^" -gravity center -extent "${S}x${S}" -blur "0x$((S/10))" "$D/ic_launcher_background.png"
+              else
+                convert -size "${S}x${S}" xc:white "$D/ic_launcher_background.png"
+              fi
+            done
+            mkdir -p "$R/mipmap-anydpi-v26"
+            for n in ic_launcher ic_launcher_round; do
+              printf '%s\n' '<?xml version="1.0" encoding="utf-8"?>' '<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">' '    <background android:drawable="@mipmap/ic_launcher_background"/>' '    <foreground android:drawable="@mipmap/ic_launcher_foreground"/>' '</adaptive-icon>' > "$R/mipmap-anydpi-v26/$n.xml"
+            done
+            echo "Applied the custom icon to the Android resources"
+          }
+          build_app() {
+            echo "== Build attempt: $1"
+            rm -rf app
+            cordova create app "$APPID" "$NAME" || return 1
+            cd app
+            if [ "$TYPE" = web ]; then rm -rf www/*; cp -r ../src/. www/; fi
+            MODE="$1" node "$RUNNER_TEMP/patch.js" || { cd ..; return 1; }
+            if [ "$1" = full ] && [ "${HASICONS:-}" = 1 ]; then mkdir -p res/icon && cp "$RUNNER_TEMP"/icons/*.png res/icon/; fi
+            if [ "$1" != minimal ] && [ "${TV:-}" = 1 ]; then mkdir -p res && cp "$RUNNER_TEMP/banner.png" res/banner.png; fi
+            PV=""
+            if [ "${RELEASE:-}" = 1 ]; then PV="@15"; fi
+            cordova platform add "android$PV" || { cd ..; return 1; }
+            if { [ "$1" = full ] || [ "$1" = direct ]; } && [ "${HASICONS:-}" = 1 ]; then apply_icons || echo "Could not apply the icon directly"; fi
+            if [ "${RELEASE:-}" = 1 ]; then
+              PW=$(cat "$KSPASS_FILE")
+              KS="$RUNNER_TEMP/ks/$APPID.jks"
+              cordova build android --release -- --keystore="$KS" --storePassword="$PW" --alias=upload --password="$PW" --packageType=bundle || { cd ..; return 1; }
+              cordova build android --release -- --keystore="$KS" --storePassword="$PW" --alias=upload --password="$PW" --packageType=apk || { cd ..; return 1; }
+            else
+              cordova build android --debug || { cd ..; return 1; }
+            fi
+            cd ..
+          }
+          run_build() {
+            LAST=minimal
+            if [ "${RELEASE:-}" = 1 ] || [ "${TV:-}" = 1 ]; then LAST=noicons; fi
+            if build_app full; then
+              echo "Built with the adaptive icon"
+            elif [ "${HASICONS:-}" = 1 ] && build_app direct; then
+              echo "Built with the icon applied directly"
+            else
+              build_app "$LAST"
+              if [ "${HASICONS:-}" = 1 ]; then echo "::warning title=Android Builder note::Your custom icon was NOT applied because the build failed with it."; fi
+            fi
+            if [ "${RELEASE:-}" = 1 ]; then
+              cp app/platforms/android/app/build/outputs/bundle/release/app-release.aab app.aab
+              cp app/platforms/android/app/build/outputs/apk/release/app-release.apk app.apk
+            else
+              cp app/platforms/android/app/build/outputs/apk/debug/app-debug.apk app.apk
+            fi
+          }
+          SH
+      - name: Build app (Cordova)
+        if: env.TYPE == 'url' || env.TYPE == 'web'
+        run: |
+          set -e
+          exec > >(tee -a "$RUNNER_TEMP/build.log") 2>&1
+          npm i -g cordova
+          source "$RUNNER_TEMP/cbuild.sh"
+          run_build
+      - uses: gradle/actions/setup-gradle@v4
+        if: env.TYPE == 'gradle'
+        with:
+          gradle-version: 8.7
+      - name: Build Android project (Gradle)
+        if: env.TYPE == 'gradle'
+        run: |
+          set -e
+          exec > >(tee -a "$RUNNER_TEMP/build.log") 2>&1
+          cd src
+          rm -f local.properties
+          [ -f gradle.properties ] && sed -i '/aapt2FromMavenOverride/d' gradle.properties || true
+          if [ -f gradlew ]; then chmod +x gradlew; ./gradlew assembleDebug --no-daemon; else gradle assembleDebug --no-daemon; fi
+          APK=$(find . -path '*build/outputs/apk/debug/*.apk' | head -n1)
+          cp "$APK" ../app.apk
+      - uses: subosito/flutter-action@v2
+        if: env.TYPE == 'flutter'
+        with:
+          channel: stable
+      - name: Build Flutter app
+        if: env.TYPE == 'flutter'
+        run: |
+          set -e
+          exec > >(tee -a "$RUNNER_TEMP/build.log") 2>&1
+          cd src
+          flutter build apk --release --target-platform android-arm64 --build-name "$VNAME" --build-number "$VCODE"
+          cp build/app/outputs/flutter-apk/app-release.apk ../app.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: apk-${{ inputs.id }}
+          path: |
+            app.apk
+            app.aab
+          retention-days: 3
+      - name: Publish APK
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          exec > >(tee -a "$RUNNER_TEMP/build.log") 2>&1
+          test -f app.apk
+          P="$RUNNER_TEMP/pub"
+          mkdir -p "$P"
+          cp app.apk "$P/$ID.apk"
+          if [ -f app.aab ]; then cp app.aab "$P/$ID.aab"; fi
+          cd "$P"
+          git init -q -b out
+          git add -A
+          git -c user.name=bot -c user.email=bot@users.noreply.github.com commit -qm "apk $ID"
+          git push -f "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" HEAD:refs/heads/out
+      - name: Report error
+        if: failure()
+        run: |
+          if [ -f "$RUNNER_TEMP/build.log" ]; then
+            MSG=$(grep -iE "error|fail|exception|not found|invalid|cannot|unable|denied" "$RUNNER_TEMP/build.log" | tail -n 10 | cut -c1-260 | tr -d '%\r' | sed -E 's/(assword|storePassword)=[^ ]+/\1=***/g' | tr '\n' '|')
+            [ -n "$MSG" ] || MSG=$(tail -n 6 "$RUNNER_TEMP/build.log" | cut -c1-260 | tr -d '%\r' | tr '\n' '|')
+            echo "::error title=Build error::$MSG"
+          fi
+      - name: Delete uploaded source
+        if: always()
+        run: |
+          git rm -q "jobs/$ID.zip" || true
+          git -c user.name=bot -c user.email=bot@users.noreply.github.com commit -qm "clean $ID" || true
+          git push origin HEAD:jobs || true
